@@ -1,3 +1,66 @@
+# Solución QualyData — Pipeline Determinista a Escala (Track Datos y Streaming)
+
+## Ejecución en 1 solo comando (100% reproducible)
+
+Linux / macOS:
+```bash
+PYTHONHASHSEED=42 python correr.py --datos datos/final --entrega entrega
+```
+
+Windows (PowerShell):
+```powershell
+$env:PYTHONHASHSEED="42"
+.\.venv\Scripts\python.exe correr.py --datos datos/final --entrega entrega
+```
+
+Genera en `entrega/` **exactamente los 4 archivos oficiales**:
+- `comentarios.csv`, `narrativas.csv`, `cuentas.csv`, `costo.json`
+
+Y genera el reporte visual interactivo en [`docs/dashboard.html`](docs/dashboard.html) (línea de tiempo de aparición, posturas apoya/rechaza y red de coordinación CIB).
+
+## Arquitectura, Almacenamiento y Escala (150k → 10M+ comentarios/día)
+
+1. **Motor OLAP embebido (DuckDB + Parquet `zstd`)**: en [`pipeline/common.py`](pipeline/common.py), los CSV comprimidos se ingieren en `< 1s` a tablas columnares Parquet (`zstd`, `14.35 MB` para 200k comentarios en práctica; `19.34 MB` junto a `qualydata.duckdb` en disco) sin servidores externos.
+   - **Por qué DuckDB + Parquet `zstd`:** compresión columnar de alto ratio (~4–5x frente a CSV), lectura selectiva por columna (*projection pushdown*) y ejecución vectorizada fuera de núcleo (*out-of-core*) para cruces temporales y proyecciones bipartitas.
+   - **Cómo escala a millones de comentarios por día:** (a) particionando los Parquet por fecha (`dt=YYYY-MM-DD/`) para procesar solo ventanas nuevas o incrementales; (b) deduplicando textos normalizados con hash antes de vectorizar (en práctica 200k → 61.6k únicos, reducción ~3.2x); (c) haciendo el *equi-join* temporal de coordinación mediante *buckets* por `(publicacion_id, ventana)` en SQL vectorizado en vez de comparar pares en Python.
+2. **Tarea A — Narrativas ([`pipeline/narrativas.py`](pipeline/narrativas.py))**:
+   - Deduplicación por texto normalizado y filtrado de ruido corto (`< 4` palabras).
+   - Embeddings locales FP16 en GPU (con fallback automático a FP32 en CPU) usando `sentence-transformers/paraphrase-multilingual-mpnet-base-v2` (revisión fijada `4328cf26390c98c5e3c738b4460a05b95f4911f5`), `batch_size=256`, costo `$0.00`.
+   - Clustering en 2 etapas: grafo k-NN exacto en PyTorch + Leiden de alta resolución (micro-clústeres puros) seguido de fusión por grafo de afinidad de respuestas (`respuesta_a`) y similitud coseno de centroides.
+   - Fecha de origen por *changepoint* de activación sostenida (evita falsos orígenes por goteo previo).
+   - Etiquetado local determinista (c-TF-IDF + texto representativo afirmativo) y clasificación de postura local con NLI multilingüe (`MoritzLaurer/mDeBERTa-v3-base-mnli-xnli`, revisión fijada `8adb042d524ecd5c26d3e3ba0e3fbcf7e2d0864c`) por micro-clúster + propagación en cadenas de respuestas (`respuesta_a`).
+3. **Tarea B — Coordinación CIB ([`pipeline/coordinacion.py`](pipeline/coordinacion.py))**:
+   - Proyección bipartita Cuenta-a-Cuenta en DuckDB mediante *equi-join* por ventanas desplazadas de 30 minutos (`|Δt| ≤ 1200s`), penalizando el peso inversamente al volumen viral de la publicación (`1 / (1 + ln²(1 + vol))`), sumado a repetición textual, respuestas mutuas y antigüedad relativa de creación.
+   - Detección de comunidades con Leiden (`seed=42`) filtrada por cohesión interna (`avg_deg >= 5.0`, `density >= 0.35`, `mean_w >= 0.30`).
+
+## Código, Modelos y Librerías Previos al Evento
+
+- **Modelos públicos preentrenados (con hash de revisión fijado en código):** `sentence-transformers/paraphrase-multilingual-mpnet-base-v2` (`4328cf26390c98c5e3c738b4460a05b95f4911f5`) y `MoritzLaurer/mDeBERTa-v3-base-mnli-xnli` (`8adb042d524ecd5c26d3e3ba0e3fbcf7e2d0864c`).
+- **Librerías open-source:** `duckdb`, `polars`, `pyarrow`, `torch`, `sentence-transformers`, `transformers`, `python-igraph`, `leidenalg`, `scikit-learn`, `pandas`, `numpy`, `psutil` (versiones fijadas en [`requirements.txt`](requirements.txt)).
+- **Código original:** todo el pipeline (`correr.py` y `pipeline/*.py`) fue desarrollado íntegramente durante el hackathon.
+
+## Formato de `costo.json`
+
+Todos los campos se reportan automáticamente vía telemetría (`@medir`), incluso cuando el costo de API es `0.0`:
+
+```json
+{
+  "comentarios_procesados": 150000,
+  "segundos": 30.88,
+  "tokens_ia": 0,
+  "usd_ia": 0.0,
+  "usd_por_mil_comentarios": 0.0,
+  "hardware": "AMD64 Family 25 Model 33 Stepping 2, AuthenticAMD, 8 cores, 15 GB RAM, NVIDIA GeForce RTX 3060 11 GB VRAM",
+  "almacenamiento": "DuckDB + Parquet zstd (19.34 MB en disco)",
+  "ram_pico_mb": 2213.3,
+  "vram_pico_mb": 796.3,
+  "etapas": {},
+  "notas": "Embeddings locales FP16 (mpnet) + Leiden GPU k-NN + grafo respuesta_a + DuckDB CIB"
+}
+```
+
+---
+
 # Desafío QualyData: narrativas y coordinación a escala
 
 **Hackathon Argentina Space 2026** · Track Datos y Streaming · Centro de Convenciones de Salta · 11 al 13 de noviembre de 2026

@@ -1,0 +1,39 @@
+{
+  "comentarios_procesados": 150000,
+  "segundos": 49.18,
+  "tokens_ia": 0,
+  "usd_ia": 0.0,
+  "usd_por_mil_comentarios": 0.0,
+  "hardware": "AMD64 Family 25 Model 33 Stepping 2, AuthenticAMD, 8 cores, 15 GB RAM, NVIDIA GeForce RTX 3060 11 GB VRAM",
+  "almacenamiento": "DuckDB + Parquet zstd (10.34 MB en disco)",
+  "ram_pico_mb": 2744.2,
+  "vram_pico_mb": 1426.9,
+  "etapas": {
+    "ingesta_duckdb": {
+      "segundos": 0.63,
+      "ram_mb": 791,
+      "vram_pico_mb": 0
+    },
+    "embeddings_gpu": {
+      "segundos": 19.25,
+      "ram_mb": 2306,
+      "vram_pico_mb": 1427
+    },
+    "postura_nli": {
+      "segundos": 4.0,
+      "ram_mb": 2744,
+      "vram_pico_mb": 1342
+    },
+    "narrativas_clustering": {
+      "segundos": 40.2,
+      "ram_mb": 2433,
+      "vram_pico_mb": 1342
+    },
+    "coordinacion_duckdb_leiden": {
+      "segundos": 8.26,
+      "ram_mb": 2589,
+      "vram_pico_mb": 580
+    }
+  },
+  "notas": "Embeddings locales FP16 (mpnet) + Leiden GPU k-NN + grafo respuesta_a + DuckDB CIB"
+}

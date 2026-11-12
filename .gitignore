@@ -2,5 +2,12 @@
 __pycache__/
 *.pyc
 salida/
-datos/final/
+datos/
+qualydata.duckdb
+*.duckdb
+*.duckdb.wal
+*.parquet
+*.npy
+*.sha256
+.env
 .DS_Store
