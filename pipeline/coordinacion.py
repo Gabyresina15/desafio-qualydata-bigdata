@@ -1,10 +1,14 @@
 """Tarea B: Deteccion de operaciones coordinadas via grafo bipartito en DuckDB + Leiden."""
+import re
+
 import igraph as ig
 import leidenalg
 import numpy as np
 import pandas as pd
 
 from pipeline.common import medir, normalizar
+
+HASHTAG_RE = re.compile(r"#[a-z0-9_ñáéíóú]+")
 
 
 @medir("coordinacion_duckdb_leiden")
@@ -20,10 +24,24 @@ def detectar_coordinacion(con, df_comentarios: pd.DataFrame, df_cuentas: pd.Data
     cu["fc_dt"] = pd.to_datetime(cu["fecha_creacion"], utc=True)
     cu["age_d"] = (t_min_data - cu["fc_dt"]).dt.total_seconds() / 86400.0
 
+    # Extraccion de hashtags por comentario para capturar campanas de hashtags raros
+    ht_rows = []
+    for cid, txt in zip(c["cuenta_id"], c["texto"]):
+        if "#" in txt:
+            for tg in set(HASHTAG_RE.findall(txt.lower())):
+                ht_rows.append((cid, tg))
+    df_ht = (
+        pd.DataFrame(ht_rows, columns=["cuenta_id", "tag"])
+        if ht_rows
+        else pd.DataFrame({"cuenta_id": pd.Series(dtype=str), "tag": pd.Series(dtype=str)})
+    )
+
     con.register("tmp_com_coord", c[["comentario_id", "publicacion_id", "cuenta_id", "ts", "norm", "nwords", "respuesta_a"]])
     con.register("tmp_cta_coord", cu[["cuenta_id", "age_d"]])
+    con.register("tmp_ht_coord", df_ht)
+    max_ht_acc = max(10, int(0.015 * len(cu)))
 
-    pairs = con.execute("""
+    pairs = con.execute(f"""
         WITH b AS (
             SELECT comentario_id, publicacion_id, cuenta_id, ts, norm, nwords,
                    (ts // 1800) AS b1,
@@ -59,7 +77,23 @@ def detectar_coordinacion(con, df_comentarios: pd.DataFrame, df_cuentas: pd.Data
             SELECT u, v, COUNT(*) AS k_sync, SUM(w) AS sum_w, SUM(exact_txt) AS n_exact
             FROM co
             GROUP BY 1, 2
-            HAVING COUNT(*) >= 2
+        ),
+        ht_cnt AS (
+            SELECT tag, COUNT(DISTINCT cuenta_id) AS n_acc
+            FROM tmp_ht_coord
+            GROUP BY 1
+            HAVING n_acc BETWEEN 2 AND {max_ht_acc}
+        ),
+        ht_u AS (
+            SELECT DISTINCT h.cuenta_id, h.tag
+            FROM tmp_ht_coord h
+            JOIN ht_cnt c ON h.tag = c.tag
+        ),
+        ht_pairs AS (
+            SELECT a.cuenta_id AS u, b.cuenta_id AS v, COUNT(*) AS k_ht
+            FROM ht_u a
+            JOIN ht_u b ON a.tag = b.tag AND a.cuenta_id < b.cuenta_id
+            GROUP BY 1, 2
         ),
         rep AS (
             SELECT LEAST(c1.cuenta_id, c2.cuenta_id) AS u,
@@ -69,14 +103,26 @@ def detectar_coordinacion(con, df_comentarios: pd.DataFrame, df_cuentas: pd.Data
             JOIN tmp_com_coord c2 ON c1.respuesta_a = c2.comentario_id
             WHERE c1.respuesta_a <> '' AND c1.cuenta_id <> c2.cuenta_id
             GROUP BY 1, 2
+        ),
+        keys AS (
+            SELECT u, v FROM agg_co WHERE k_sync >= 2
+            UNION
+            SELECT u, v FROM ht_pairs
         )
-        SELECT a.u, a.v, a.k_sync, a.sum_w, a.n_exact, COALESCE(r.n_rep, 0) AS n_rep,
+        SELECT k.u, k.v,
+               COALESCE(a.k_sync, 0) AS k_sync,
+               COALESCE(a.sum_w, 0.0) AS sum_w,
+               COALESCE(a.n_exact, 0) AS n_exact,
+               COALESCE(h.k_ht, 0) AS k_ht,
+               COALESCE(r.n_rep, 0) AS n_rep,
                cu1.age_d AS age_u, cu2.age_d AS age_v
-        FROM agg_co a
-        LEFT JOIN rep r ON a.u = r.u AND a.v = r.v
-        JOIN tmp_cta_coord cu1 ON a.u = cu1.cuenta_id
-        JOIN tmp_cta_coord cu2 ON a.v = cu2.cuenta_id
-        ORDER BY a.u, a.v
+        FROM keys k
+        LEFT JOIN agg_co a ON k.u = a.u AND k.v = a.v
+        LEFT JOIN ht_pairs h ON k.u = h.u AND k.v = h.v
+        LEFT JOIN rep r ON k.u = r.u AND k.v = r.v
+        JOIN tmp_cta_coord cu1 ON k.u = cu1.cuenta_id
+        JOIN tmp_cta_coord cu2 ON k.v = cu2.cuenta_id
+        ORDER BY k.u, k.v
     """).df()
 
     acc_list = sorted(cu["cuenta_id"].unique())
@@ -88,12 +134,13 @@ def detectar_coordinacion(con, df_comentarios: pd.DataFrame, df_cuentas: pd.Data
     k_arr = pairs["k_sync"].to_numpy()
     w_arr = pairs["sum_w"].to_numpy()
     ex_arr = pairs["n_exact"].to_numpy()
+    ht_arr = pairs["k_ht"].to_numpy()
     rep_arr = pairs["n_rep"].to_numpy()
     both_new = (pairs["age_u"].to_numpy() < 30) & (pairs["age_v"].to_numpy() < 30)
 
-    mask = (k_arr >= 3) | (both_new & (k_arr >= 2))
+    mask = (k_arr >= 3) | (both_new & (k_arr >= 2)) | (ht_arr >= 1)
     edges = list(zip(u_idx[mask].tolist(), v_idx[mask].tolist()))
-    wts = (w_arr[mask] + 0.5 * ex_arr[mask] + 0.3 * rep_arr[mask] + 0.4 * both_new[mask]).tolist()
+    wts = (w_arr[mask] + 0.5 * ex_arr[mask] + 0.3 * rep_arr[mask] + 0.4 * both_new[mask] + 0.8 * ht_arr[mask]).tolist()
 
     g = ig.Graph(n=n_acc, edges=edges, directed=False)
     g.es["weight"] = wts
@@ -107,7 +154,7 @@ def detectar_coordinacion(con, df_comentarios: pd.DataFrame, df_cuentas: pd.Data
     gid = 1
     flagged_nodes = set()
     for v_id, cnt in sorted(zip(vals, cnts), key=lambda x: (-x[1], x[0])):
-        if cnt < 8 or cnt > 400:
+        if cnt < 6 or cnt > 400:
             continue
         nodes = np.where(mem == v_id)[0]
         sub = g.subgraph(nodes.tolist())

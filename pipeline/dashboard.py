@@ -1,5 +1,6 @@
-"""Genera entrega/dashboard.html: reporte interactivo autocontenido (linea de tiempo, posturas, grafo CIB)."""
+"""Genera docs/dashboard.html: reporte interactivo autocontenido (linea de tiempo, posturas, grafo y fichas CIB)."""
 import json
+import re
 from pathlib import Path
 
 import pandas as pd
@@ -25,24 +26,50 @@ def generar_dashboard(
         nid = row["narrativa"]
         sub = valid[valid["narrativa"] == nid]
         counts = sub.groupby("dia").size().to_dict()
-        ap = int((sub["postura"] == "apoya").sum())
-        re = int((sub["postura"] == "rechaza").sum())
+        n_ap = int((sub["postura"] == "apoya").sum())
+        n_re = int((sub["postura"] == "rechaza").sum())
         series.append({
             "id": nid,
             "titulo": row["titulo"][:85],
             "frases": row["frases_clave"],
             "origen": row["fecha_origen"][:16].replace("T", " "),
             "total": len(sub),
-            "apoya": ap,
-            "rechaza": re,
+            "apoya": n_ap,
+            "rechaza": n_re,
             "diario": [int(counts.get(d, 0)) for d in dias],
         })
     series.sort(key=lambda x: -x["total"])
 
-    # Resumen de grupos coordinados
+    # Resumen y fichas por operacion coordinada
     coord_df = df_cta[df_cta["grupo"] != ""]
     grupos_resumen = coord_df.groupby("grupo").size().sort_values(ascending=False).to_dict()
     nodos = [{"id": r.cuenta_id, "grupo": r.grupo} for r in coord_df.itertuples()]
+
+    fichas_cib = []
+    if len(coord_df):
+        c_coord = df_raw.merge(coord_df, on="cuenta_id")
+        c_coord["dt_ar"] = pd.to_datetime(c_coord["fecha"], utc=True).dt.tz_convert("-03:00")
+        for g_id, n_ctas in grupos_resumen.items():
+            sub_g = c_coord[c_coord["grupo"] == g_id]
+            tags = []
+            for tx in sub_g["texto"]:
+                if "#" in tx:
+                    tags.extend(re.findall(r"#[a-z0-9_ñáéíóú]+", tx.lower()))
+            top_tags = [k for k, _ in pd.Series(tags).value_counts().head(4).items()] if tags else []
+            top_pubs = sub_g["publicacion_id"].value_counts().head(3).index.tolist()
+            n_ed = sum(1 for e in aristas if e.get("grupo") == g_id)
+            ej = sub_g["texto"].value_counts().head(2).index.tolist()
+            fichas_cib.append({
+                "grupo": g_id,
+                "cuentas": int(n_ctas),
+                "comentarios": int(len(sub_g)),
+                "aristas": int(n_ed),
+                "hashtags": top_tags,
+                "pubs": top_pubs,
+                "desde": sub_g["dt_ar"].min().strftime("%Y-%m-%d %H:%M"),
+                "hasta": sub_g["dt_ar"].max().strftime("%Y-%m-%d %H:%M"),
+                "ejemplos": [x[:95] for x in ej],
+            })
 
     payload = {
         "costo": costo,
@@ -50,6 +77,7 @@ def generar_dashboard(
         "narrativas": series,
         "ruido": int((m["narrativa"] == "").sum()),
         "grupos": grupos_resumen,
+        "fichas_cib": fichas_cib,
         "nodos": nodos,
         "aristas": aristas,
     }
@@ -94,6 +122,10 @@ def generar_dashboard(
       <div id="grupos-info" style="font-size:12px;color:#94a3b8;margin-top:8px;"></div>
     </div>
   </div>
+  <div class="card" style="margin-bottom:20px;">
+    <h2>Fichas por Operacion Coordinada (CIB)</h2>
+    <div id="fichas" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px;"></div>
+  </div>
   <div class="card">
     <h2>Narrativas Descubiertas, Origen y Postura (Apoya vs Rechaza)</h2>
     <table>
@@ -113,6 +145,18 @@ const kpis = [
 document.getElementById('kpis').innerHTML = kpis.map(([l,v]) => `<div class="kpi"><div class="v">${{v}}</div><div class="l">${{l}}</div></div>`).join('');
 
 const PAL = ['#38bdf8','#22c55e','#f59e0b','#ef4444','#a855f7','#ec4899','#14b8a6','#eab308','#6366f1','#fb7185'];
+document.getElementById('fichas').innerHTML = D.fichas_cib.map((f,i) => `
+  <div style="background:#0f172a;border:1px solid #334155;border-radius:8px;padding:12px;font-size:12px;">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+      <span class="pill" style="color:${{PAL[i%PAL.length]}};font-weight:700;">${{f.grupo}}</span>
+      <span style="color:#94a3b8;">${{f.cuentas}} cuentas · ${{f.comentarios.toLocaleString()}} com.</span>
+    </div>
+    <div style="color:#cbd5e1;margin-bottom:4px;"><b>Actividad:</b> ${{f.desde}} a ${{f.hasta}}</div>
+    <div style="color:#cbd5e1;margin-bottom:4px;"><b>Hashtags:</b> ${{f.hashtags.length ? f.hashtags.join(', ') : 'Sin hashtags (co-sincronía)'}}</div>
+    <div style="color:#cbd5e1;margin-bottom:4px;"><b>Foco pubs:</b> ${{f.pubs.join(', ')}}</div>
+    <div style="color:#94a3b8;font-style:italic;">"${{f.ejemplos[0] || ''}}"</div>
+  </div>
+`).join('') || '<div style="color:#94a3b8;font-size:13px;">Sin operaciones detectadas</div>';
 document.getElementById('tbl').innerHTML = D.narrativas.map((n,i) => {{
   const pAp = (100 * n.apoya / Math.max(n.total,1)).toFixed(0);
   const pRe = 100 - pAp;

@@ -2,6 +2,8 @@
 import hashlib
 import json
 import os
+import re
+import time
 from pathlib import Path
 
 import igraph as ig
@@ -9,8 +11,9 @@ import leidenalg
 import numpy as np
 import pandas as pd
 import torch
+from scipy.sparse import csr_matrix, hstack
 from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.preprocessing import normalize
+from sklearn.linear_model import LogisticRegression
 
 from pipeline.common import medir, normalizar, registrar_tokens
 
@@ -18,19 +21,27 @@ STOPWORDS = sorted({
     "a", "al", "algo", "con", "como", "de", "del", "el", "ella", "en", "es", "esa", "ese", "eso",
     "esta", "este", "esto", "la", "las", "le", "lo", "los", "mas", "me", "mi", "muy", "no", "nos",
     "o", "para", "pero", "por", "que", "se", "si", "sin", "su", "sus", "te", "todo", "todos", "un",
-    "una", "uno", "y", "ya", "ahi", "aca", "hay", "ver", "digo", "ser", "esta", "son", "tan",
+    "una", "uno", "y", "ya", "ahi", "aca", "hay", "ver", "digo", "ser", "son", "tan",
 })
 
 REFUTE_PURE = [
-    "mentira", "falso", "falsa", "fake", "verso", "nada que ver", "no es cierto", "trucho",
-    "trucha", "desmintio", "sin pruebas", "inventan", "dejen de", "no es verdad", "puro cuento",
-    "chamuyo", "humo", "opereta", "de otro lado", "no tiene sentido", "es viejo", "audio viejo",
+    "mentira", "mentiras", "falso", "falsa", "fake", "verso", "nada que ver", "no es cierto",
+    "trucho", "trucha", "desmintio", "desmintieron", "sin pruebas", "inventan", "invento",
+    "dejen de", "no es verdad", "puro cuento", "chamuyo", "humo", "opereta", "de otro lado",
+    "no tiene sentido", "es viejo", "audio viejo", "foto vieja", "video viejo", "cualquiera",
 ]
 AGREE_PURE = [
     "coincido", "tal cual", "exacto", "100%", "posta", "asi es", "clarisimo", "totalmente",
-    "eso mismo", "ni mas ni menos", "lo mismo digo", "de acuerdo", "toda la razon",
+    "eso mismo", "ni mas ni menos", "lo mismo digo", "de acuerdo", "toda la razon", "confirmo",
 ]
 
+# Regex compiladas con limites de palabra para evitar falsos positivos (ej: "verso" en "universo")
+_REFUTE_RE = re.compile(
+    r"(?<!\w)(?:" + "|".join(re.escape(w) for w in REFUTE_PURE) + r")(?!\w)"
+)
+_AGREE_RE = re.compile(
+    r"(?<!\w)(?:" + "|".join(re.escape(w) for w in AGREE_PURE) + r")(?!\w)"
+)
 
 EMBED_MODEL = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
 EMBED_REV = "4328cf26390c98c5e3c738b4460a05b95f4911f5"
@@ -70,16 +81,17 @@ def calcular_embeddings(textos_unicos: list[str], cache_path: Path | None = None
 
 def _knn_gpu(E: np.ndarray, k: int = 30, force_cpu: bool = False) -> tuple[np.ndarray, np.ndarray]:
     n = len(E)
+    k_eff = max(1, min(k, n - 1))
     device = "cpu" if (force_cpu or not torch.cuda.is_available()) else "cuda"
     dtype = torch.float16 if device == "cuda" else torch.float32
     Et = torch.from_numpy(E).to(device, dtype=dtype)
-    top_vals = np.empty((n, k), dtype=np.float32)
-    top_idx = np.empty((n, k), dtype=np.int32)
+    top_vals = np.empty((n, k_eff), dtype=np.float32)
+    top_idx = np.empty((n, k_eff), dtype=np.int32)
     bs = 2048 if device == "cuda" else 1024
     with torch.no_grad():
         for i in range(0, n, bs):
             sims = Et[i:i + bs] @ Et.T
-            vals, inds = torch.topk(sims, min(k + 1, n), dim=1)
+            vals, inds = torch.topk(sims, k_eff + 1, dim=1)
             top_vals[i:i + bs] = vals[:, 1:].float().cpu().numpy()
             top_idx[i:i + bs] = inds[:, 1:].cpu().numpy()
     return top_vals, top_idx
@@ -90,7 +102,6 @@ def _estimar_origen(dts: pd.Series, t_min_global: pd.Timestamp) -> pd.Timestamp:
     s = dts.sort_values()
     if len(s) < 20:
         return s.quantile(0.05)
-    # Rejilla horaria desde t_min_global para comparar tasa previa vs posterior
     end_t = s.max()
     idx_hr = pd.date_range(t_min_global.floor("h"), end_t.ceil("h"), freq="1h", tz="UTC")
     hr_raw = s.to_frame("dt").assign(cnt=1).set_index("dt").resample("1h")["cnt"].sum()
@@ -115,28 +126,74 @@ def _estimar_origen(dts: pd.Series, t_min_global: pd.Timestamp) -> pd.Timestamp:
     return s.quantile(0.01)
 
 
+IA_CACHE_REPO = Path(__file__).resolve().parent / "ia_cache.json"
+
+
 def _llamar_llm_cluster(ejemplos: list[str], cache_file: Path, key: str) -> dict | None:
-    """Llama 1 vez por cluster con temperature=0 y seed=42 (con cache determinista en disco)."""
-    cache = {}
-    if cache_file.exists():
-        cache = json.loads(cache_file.read_text(encoding="utf-8"))
-        if key in cache:
-            return cache[key]
+    """Llama 1 vez por narrativa (temperature=0, seed=42) y registra respuesta en cache determinista."""
+    def _valid_posts(p):
+        if isinstance(p, dict) and len(p) >= max(5, len(ejemplos) // 2):
+            return True
+        if isinstance(p, list) and len(p) >= max(5, len(ejemplos) // 2):
+            return True
+        return False
+
+    for cf in (cache_file, IA_CACHE_REPO):
+        if cf.exists():
+            try:
+                cache_d = json.loads(cf.read_text(encoding="utf-8"))
+                if key in cache_d and _valid_posts(cache_d[key].get("posturas")):
+                    entry = cache_d[key]
+                    registrar_tokens(entry.get("_tokens", 0), entry.get("_usd", 0.0))
+                    return entry
+            except Exception:
+                pass
 
     api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("OPENAI_API_KEY")
     if not api_key:
         return None
 
+    numbered = "\n".join(f"{i}: {t}" for i, t in enumerate(ejemplos))
+    n_ej = len(ejemplos)
     prompt = (
-        "Sos un analista de narrativas en redes sociales argentinas. "
-        "Dado este conjunto de comentarios representativos de un mismo debate, devolve SOLO un JSON valido con:\n"
-        '{"titulo": "frase corta afirmativa que resuma la tesis principal del debate", '
-        '"frases_clave": ["t1", "t2", "t3", "t4", "t5"], '
-        '"apoya": ["3 frases prototipo que afirman o defienden la tesis"], '
-        '"rechaza": ["3 frases prototipo que niegan o refutan la tesis"]}\n\n'
-        "Comentarios:\n- " + "\n- ".join(ejemplos[:15])
+        "Sos un analista experto en detección de narrativas en redes sociales argentinas.\n"
+        f"Abajo hay {n_ej} comentarios representativos (numerados de 0 a {n_ej - 1}) que pertenecen a un mismo clúster temático.\n\n"
+        "REGLAS ESTRICTAS DE ANÁLISIS:\n"
+        "1. ANCLAJE DE LA TESIS CENTRAL ('titulo'): Identificá el reclamo, acusación, rumor o afirmación originaria que dispara la discusión. "
+        "Redactá el 'titulo' SIEMPRE como una afirmación directa y activa (ej: 'La obra se frenó porque desviaron los fondos'), "
+        "NUNCA como un tema neutro ('Debate sobre la obra') ni como una negación/desmentida, para no invertir las posturas.\n"
+        "2. VARIACIÓN LÉXICA ('frases_clave'): Extraé exactamente 5 frases cortas o sintagmas representativos que capturen las distintas formas "
+        "en que los usuarios expresan esta narrativa.\n"
+        "3. CLASIFICACIÓN DE POSTURA ('posturas'): Evaluá cada comentario (0 a "
+        f"{n_ej - 1}) respecto a la afirmación exacta del 'titulo', detectando sarcasmo e ironía argentina:\n"
+        '   - "apoya": afirma, amplifica, da por cierta o ironiza a favor de la tesis del "titulo".\n'
+        '   - "rechaza": niega, desmiente, defiende a la parte acusada, minimiza o refuta la tesis del "titulo".\n'
+        "   (Nota: No asumas una proporción fija; clasificá cada comentario por su intención real).\n\n"
+        "FORMATO DE SALIDA:\n"
+        "Respondé ÚNICAMENTE con un objeto JSON crudo y válido (sin bloques ```json ni texto adicional) que respete este esquema exacto:\n"
+        "{\n"
+        '  "titulo": "Afirmación central corta y directa",\n'
+        '  "frases_clave": ["frase 1", "frase 2", "frase 3", "frase 4", "frase 5"],\n'
+        f'  "posturas": {{"0": "apoya", "1": "rechaza", "{n_ej - 1}": "apoya"}}\n'
+        "}\n\n"
+        f"Comentarios:\n{numbered}"
     )
+
+    def _save_entry(out: dict, toks: int, usd: float) -> dict:
+        out["_tokens"] = int(toks)
+        out["_usd"] = round(float(usd), 6)
+        registrar_tokens(toks, usd)
+        try:
+            data_c = json.loads(cache_file.read_text(encoding="utf-8")) if cache_file.exists() else {}
+            data_c[key] = out
+            cache_file.parent.mkdir(parents=True, exist_ok=True)
+            cache_file.write_text(json.dumps(data_c, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+        return out
+
     try:
+        import urllib.error
         import urllib.request
         if os.environ.get("GEMINI_API_KEY"):
             url = (
@@ -144,23 +201,44 @@ def _llamar_llm_cluster(ejemplos: list[str], cache_file: Path, key: str) -> dict
                 f"gemini-2.5-flash:generateContent?key={os.environ['GEMINI_API_KEY']}"
             )
             body = {
-                "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {"temperature": 0, "seed": 42, "responseMimeType": "application/json"},
+                "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+                "generationConfig": {
+                    "temperature": 0,
+                    "seed": 42,
+                    "responseMimeType": "application/json",
+                    "thinkingConfig": {"thinkingBudget": 256},
+                },
             }
-            req = urllib.request.Request(
-                url, data=json.dumps(body).encode("utf-8"), headers={"Content-Type": "application/json"}
-            )
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                meta = data.get("usageMetadata", {})
-                toks = int(meta.get("totalTokenCount", 0))
-                registrar_tokens(toks, toks * 0.0000003)
-                txt = data["candidates"][0]["content"]["parts"][0]["text"]
-                out = json.loads(txt)
-                cache[key] = out
-                cache_file.parent.mkdir(parents=True, exist_ok=True)
-                cache_file.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
-                return out
+            for intento in range(4):
+                try:
+                    if intento > 0:
+                        time.sleep(2.0)
+                    req = urllib.request.Request(
+                        url, data=json.dumps(body).encode("utf-8"), headers={"Content-Type": "application/json"}
+                    )
+                    with urllib.request.urlopen(req, timeout=60) as resp:
+                        data = json.loads(resp.read().decode("utf-8"))
+                        meta = data.get("usageMetadata", {})
+                        p_tok = int(meta.get("promptTokenCount", 0))
+                        o_tok = int(meta.get("candidatesTokenCount", 0)) + int(meta.get("thoughtsTokenCount", 0))
+                        toks = int(meta.get("totalTokenCount", p_tok + o_tok))
+                        usd = (p_tok * 0.30 + o_tok * 2.50) / 1e6
+                        txt = data["candidates"][0]["content"]["parts"][0]["text"]
+                        out = json.loads(txt)
+                        if _valid_posts(out.get("posturas")):
+                            return _save_entry(out, toks, usd)
+                        break
+                except urllib.error.HTTPError as e:
+                    err_txt = ""
+                    try:
+                        err_txt = e.read().decode("utf-8")[:180]
+                    except Exception:
+                        pass
+                    if e.code in (429, 503) and intento < 3:
+                        time.sleep(15 * (intento + 1))
+                        continue
+                    print(f"[LLM warn] HTTP {e.code} en key={key}: {err_txt}", flush=True)
+                    raise
         if os.environ.get("OPENAI_API_KEY"):
             req = urllib.request.Request(
                 "https://api.openai.com/v1/chat/completions",
@@ -173,15 +251,13 @@ def _llamar_llm_cluster(ejemplos: list[str], cache_file: Path, key: str) -> dict
                 }).encode("utf-8"),
                 headers={"Authorization": f"Bearer {os.environ['OPENAI_API_KEY']}", "Content-Type": "application/json"},
             )
-            with urllib.request.urlopen(req, timeout=30) as resp:
+            with urllib.request.urlopen(req, timeout=60) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
-                toks = data.get("usage", {}).get("total_tokens", 0)
-                registrar_tokens(toks, toks * 0.0000003)
+                toks = int(data.get("usage", {}).get("total_tokens", 0))
+                usd = toks * 0.0000003
                 out = json.loads(data["choices"][0]["message"]["content"])
-                cache[key] = out
-                cache_file.parent.mkdir(parents=True, exist_ok=True)
-                cache_file.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
-                return out
+                if _valid_posts(out.get("posturas")):
+                    return _save_entry(out, toks, usd)
     except Exception:
         return None
     return None
@@ -204,6 +280,8 @@ def _clasificar_postura_nli(
             nli = AutoModelForSequenceClassification.from_pretrained(
                 NLI_MODEL, revision=NLI_REV, local_files_only=True
             ).to(device).eval()
+        if device == "cuda":
+            nli.half()
     except Exception:
         return None
 
@@ -243,7 +321,7 @@ def _clasificar_postura_nli(
                 max_length=128,
                 return_tensors="pt",
             ).to(device)
-            probs = torch.softmax(nli(**inp).logits, dim=-1).cpu().numpy()
+            probs = torch.softmax(nli(**inp).logits.float(), dim=-1).cpu().numpy()
             for j, mid in enumerate(pair_mids[i:i + bs]):
                 scores_m.setdefault(mid, []).append(float(probs[j, 0] - probs[j, 2]))
 
@@ -299,8 +377,8 @@ def procesar_narrativas(df: pd.DataFrame, cache_dir: Path) -> tuple[pd.DataFrame
     c_micro = lab_all[c["u"].values]
 
     # Etapa 2: Grafo de micro-clusters por afinidad de respuesta_a + similitud coseno
-    c_cid = c["comentario_id"].values
-    c_resp = c["respuesta_a"].values
+    c_cid = c["comentario_id"].to_numpy()
+    c_resp = c["respuesta_a"].to_numpy()
     cid_to_row = {cid: i for i, cid in enumerate(c_cid)}
 
     uniq_m = sorted(set(c_micro) - {-1})
@@ -356,7 +434,6 @@ def procesar_narrativas(df: pd.DataFrame, cache_dir: Path) -> tuple[pd.DataFrame
             break
 
     # Renumerar macro-clusters de forma determinista (por tamano descendente: n01, n02, ...)
-    # Filtrar clusters minusculos o spam sin debate (tasa de respuestas < 3%) como ruido
     counts = pd.Series(c_macro[c_macro >= 0]).value_counts()
     valid_macs = []
     for k, v in counts.items():
@@ -377,38 +454,59 @@ def procesar_narrativas(df: pd.DataFrame, cache_dir: Path) -> tuple[pd.DataFrame
     X_tf = vec.fit_transform(docs)
     terms = np.array(vec.get_feature_names_out())
 
-    norms = c["norm"].values
-    has_ref = np.array([any(m in s for m in REFUTE_PURE) for s in norms])
-    has_agr = np.array([any(m in s for m in AGREE_PURE) for s in norms])
+    # Deteccion lexica con word boundaries sobre textos unicos (mucho mas rapido y sin falsos positivos)
+    u_ref = np.array([bool(_REFUTE_RE.search(s)) for s in u], dtype=bool)
+    u_agr = np.array([bool(_AGREE_RE.search(s)) for s in u], dtype=bool)
+    u_vals = c["u"].to_numpy()
+    has_ref = u_ref[u_vals]
+    has_agr = u_agr[u_vals]
     c["ref"] = has_ref
 
-    # Mapear cada texto normalizado en u_filt a su fila en E para calculo de centroides y LLM/postura
     u_filt_map = {s: i for i, s in enumerate(u_filt)}
     t_min_global = c["dt"].min()
     narr_rows = []
-    proto_map = {}
+    ia_samples_map = {}
 
     for idx_n, lbl in enumerate(narr_labels):
         sub = c[c["narrativa"] == lbl]
-        # Top frases clave
         row_tf = X_tf[idx_n].toarray().ravel()
         top_t = [terms[j] for j in np.argsort(-row_tf)[:6]]
 
-        # 15 textos representativos diversos (1 por micro-cluster principal, ordenados por frecuencia)
+        # Muestra diversa de hasta 60 comentarios (1 por micro-cluster principal + textos mas frecuentes)
         rep_texts = []
-        for m_id, _ in sub[sub["micro"] >= 0]["micro"].value_counts().head(15).items():
-            rep_texts.append(sub[sub["micro"] == m_id]["texto"].value_counts().index[0])
+        seen_norms = set()
+        for m_id, _ in sub[sub["micro"] >= 0]["micro"].value_counts().head(35).items():
+            sub_m = sub[(sub["micro"] == m_id) & (sub["nwords"] >= 4)]
+            if len(sub_m) == 0:
+                sub_m = sub[sub["micro"] == m_id]
+            tx = sub_m["texto"].value_counts().index[0]
+            nm = normalizar(tx)
+            if nm not in seen_norms:
+                seen_norms.add(nm)
+                rep_texts.append(tx)
+        freq_norms = (
+            sub[sub["nwords"] >= 4]
+            .groupby("norm", as_index=False)
+            .agg(cnt=("texto", "count"), tx=("texto", "first"))
+            .sort_values(["cnt", "norm"], ascending=[False, True])
+        )
+        for row_f in freq_norms.itertuples():
+            if len(rep_texts) >= 60:
+                break
+            if row_f.norm not in seen_norms:
+                seen_norms.add(row_f.norm)
+                rep_texts.append(row_f.tx)
         if len(rep_texts) < 5:
-            rep_texts = sub.loc[sub["nwords"] >= 5, "texto"].value_counts().head(15).index.tolist()
+            rep_texts = sub["texto"].value_counts().head(15).index.tolist()
 
-        # Llamada opcional al LLM (1 por narrativa, cacheada)
-        llm_res = _llamar_llm_cluster(rep_texts, cache_dir / "llm_labels.json", f"{lbl}_{len(sub)}")
+        # Llamada 1 vez por narrativa (cacheada por hash de la muestra)
+        sample_key = hashlib.sha256("\n".join(rep_texts).encode("utf-8")).hexdigest()[:16]
+        llm_res = _llamar_llm_cluster(rep_texts, cache_dir / "llm_labels.json", sample_key)
         if llm_res:
             titulo = llm_res.get("titulo", rep_texts[0][:90])
             frases = "|".join(llm_res.get("frases_clave", top_t)[:6])
-            proto_map[lbl] = (llm_res.get("apoya", []), llm_res.get("rechaza", []))
+            ia_samples_map[lbl] = (rep_texts, llm_res["posturas"])
         else:
-            # Fallback local: texto representativo afirmativo que contenga alguna frase clave del cluster
             cands = sub[
                 (sub["nwords"] >= 7)
                 & (~sub["ref"])
@@ -436,29 +534,84 @@ def procesar_narrativas(df: pd.DataFrame, cache_dir: Path) -> tuple[pd.DataFrame
 
     # Postura (apoya / rechaza)
     pred_st = np.full(len(c), "", dtype=object)
-    if proto_map and len(proto_map) == len(narr_labels):
-        # Con prototipos del LLM: clasificar cada micro-cluster comparando centroide vs prototipos apoya/rechaza
-        from sentence_transformers import SentenceTransformer
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        model = SentenceTransformer(EMBED_MODEL, revision=EMBED_REV, device=device)
-        for lbl in narr_labels:
-            ap_txts, re_txts = proto_map[lbl]
-            e_ap = model.encode([normalizar(x) for x in ap_txts], normalize_embeddings=True).mean(axis=0)
-            e_re = model.encode([normalizar(x) for x in re_txts], normalize_embeddings=True).mean(axis=0)
-            e_ap /= np.linalg.norm(e_ap) + 1e-9
-            e_re /= np.linalg.norm(e_re) + 1e-9
-            sub_idx = np.where((c["narrativa"].values == lbl))[0]
-            for i in sub_idx:
-                ui = u_filt_map.get(norms[i])
-                if ui is not None:
-                    pred_st[i] = "apoya" if (E[ui] @ e_ap) >= (E[ui] @ e_re) else "rechaza"
-                else:
-                    pred_st[i] = "apoya"
-    else:
-        micro_stance = _clasificar_postura_nli(c, narr_labels, force_cpu=False)
+    norms = c["norm"].to_numpy()
+    c_narr = c["narrativa"].to_numpy()
+    c_nwords = c["nwords"].to_numpy()
+
+    if ia_samples_map:
+        dim_e = E.shape[1]
+        zeros_e = np.zeros(dim_e, dtype=np.float32)
+
+        for lbl, (s_txts, s_posts) in ia_samples_map.items():
+            lbl_map: dict[str, int] = {}
+            pairs_it = (
+                ((s_txts[int(k)], v) for k, v in s_posts.items() if str(k).isdigit() and int(k) < len(s_txts))
+                if isinstance(s_posts, dict)
+                else zip(s_txts, s_posts)
+            )
+            for tx, p_val in pairs_it:
+                p_clean = str(p_val).strip().lower()
+                if p_clean in ("apoya", "rechaza"):
+                    lbl_map[normalizar(tx)] = 1 if p_clean == "apoya" else 0
+
+            sub_idx = np.where(c_narr == lbl)[0]
+            sub_norms = [norms[i] for i in sub_idx]
+            uniq_sub_norms = sorted(set(sub_norms))
+            norm_to_u_idx = {nm: idx for idx, nm in enumerate(uniq_sub_norms)}
+
+            tr_u = [idx for idx, nm in enumerate(uniq_sub_norms) if nm in lbl_map]
+            y_tr_u = np.array([lbl_map[uniq_sub_norms[idx]] for idx in tr_u], dtype=int)
+
+            if len(set(y_tr_u)) < 2:
+                val = "apoya" if (len(y_tr_u) == 0 or y_tr_u[0] == 1) else "rechaza"
+                pred_st[sub_idx] = val
+            else:
+                # Entrenamos y predecimos sobre textos unicos del cluster (sin sesgo por spam repetido)
+                vec_st = TfidfVectorizer(ngram_range=(1, 2), max_features=2500, sublinear_tf=True)
+                X_tf_u = vec_st.fit_transform(uniq_sub_norms)
+                X_emb_u = np.vstack([E[u_filt_map[nm]] if nm in u_filt_map else zeros_e for nm in uniq_sub_norms])
+                X_lex_u = np.column_stack([
+                    [1.0 if _REFUTE_RE.search(nm) else 0.0 for nm in uniq_sub_norms],
+                    [1.0 if _AGREE_RE.search(nm) else 0.0 for nm in uniq_sub_norms],
+                ]).astype(np.float32)
+                X_u = hstack([X_tf_u, csr_matrix(X_emb_u), csr_matrix(X_lex_u * 0.6)]).tocsr()
+
+                clf = LogisticRegression(C=2.0, max_iter=500, class_weight="balanced", random_state=42)
+                clf.fit(X_u[tr_u], y_tr_u)
+                probs_u = clf.predict_proba(X_u)[:, 1]
+
+                # Suavizado por micro-cluster: los miembros de un mismo micro-cluster comparten postura
+                row_probs = np.array([probs_u[norm_to_u_idx[nm]] for nm in sub_norms], dtype=np.float32)
+                sub_micros = c_micro[sub_idx]
+                micro_prob_sum: dict[int, float] = {}
+                micro_prob_cnt: dict[int, int] = {}
+                for li, m_id in enumerate(sub_micros):
+                    if m_id >= 0:
+                        nm = sub_norms[li]
+                        p_val = float(lbl_map[nm]) if nm in lbl_map else float(row_probs[li])
+                        micro_prob_sum[m_id] = micro_prob_sum.get(m_id, 0.0) + p_val
+                        micro_prob_cnt[m_id] = micro_prob_cnt.get(m_id, 0) + 1
+
+                for li, gi in enumerate(sub_idx):
+                    nm = sub_norms[li]
+                    if nm in lbl_map:
+                        pred_st[gi] = "apoya" if lbl_map[nm] == 1 else "rechaza"
+                    else:
+                        m_id = sub_micros[li]
+                        if m_id >= 0 and micro_prob_cnt.get(m_id, 0) >= 3:
+                            m_mean = micro_prob_sum[m_id] / micro_prob_cnt[m_id]
+                            final_p = 0.60 * row_probs[li] + 0.40 * m_mean
+                        else:
+                            final_p = row_probs[li]
+                        pred_st[gi] = "apoya" if final_p >= 0.5 else "rechaza"
+
+    missing_lbls = [lbl for lbl in narr_labels if lbl not in ia_samples_map]
+    if missing_lbls:
+        micro_stance = _clasificar_postura_nli(c, missing_lbls, force_cpu=False)
+        miss_set = set(missing_lbls)
         if micro_stance is not None:
             for i in range(len(c)):
-                if c["narrativa"].iat[i] == "":
+                if c_narr[i] not in miss_set:
                     continue
                 m = c_micro[i]
                 if m >= 0 and m in micro_stance:
@@ -466,10 +619,9 @@ def procesar_narrativas(df: pd.DataFrame, cache_dir: Path) -> tuple[pd.DataFrame
                 elif has_ref[i]:
                     pred_st[i] = "rechaza"
         else:
-            # Fallback sin NLI: marcadores de refutacion por micro-cluster
             micro_ref = c[c["micro"] >= 0].groupby("micro")["ref"].mean().to_dict()
             for i in range(len(c)):
-                if c["narrativa"].iat[i] == "":
+                if c_narr[i] not in miss_set:
                     continue
                 m = c_micro[i]
                 if has_ref[i]:
@@ -479,18 +631,18 @@ def procesar_narrativas(df: pd.DataFrame, cache_dir: Path) -> tuple[pd.DataFrame
                 else:
                     pred_st[i] = "apoya"
 
-    # Herencia de postura en respuestas (regla estructural del dataset)
+    # Herencia de postura en respuestas (vectorizada sobre arrays de NumPy)
     for _ in range(3):
         for i in range(len(c)):
-            if c["narrativa"].iat[i] == "":
+            if c_narr[i] == "":
                 continue
-            if c_resp[i] != "" and (pred_st[i] == "" or c["nwords"].iat[i] < 4):
+            if c_resp[i] != "" and (pred_st[i] == "" or c_nwords[i] < 4 or has_agr[i]):
                 p = cid_to_row.get(c_resp[i])
                 if p is not None and pred_st[p] != "":
                     if has_ref[i]:
                         pred_st[i] = "rechaza" if pred_st[p] == "apoya" else "apoya"
-                    elif has_agr[i] or c["nwords"].iat[i] < 4:
+                    elif has_agr[i] or c_nwords[i] < 4:
                         pred_st[i] = pred_st[p]
 
-    c["postura"] = np.where(c["narrativa"] == "", "", np.where(pred_st == "", "apoya", pred_st))
+    c["postura"] = np.where(c_narr == "", "", np.where(pred_st == "", "apoya", pred_st))
     return c[["comentario_id", "narrativa", "postura"]], pd.DataFrame(narr_rows)
